@@ -1,0 +1,388 @@
+package peco
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"sync"
+	"time"
+
+	"github.com/lestrrat-go/pdebug"
+	"github.com/peco/peco/internal/util"
+	"github.com/peco/peco/line"
+	"github.com/peco/peco/pipeline"
+)
+
+// Source implements pipeline.Source, and is the buffer for the input
+type Source struct {
+	pipeline.ChanOutput
+
+	capacity   int
+	enableSep  bool
+	enableANSI bool
+	idgen      line.IDGenerator
+	in         io.Reader
+	inClosed   bool
+	isInfinite bool
+	lines      []line.Line
+	// start is the index of the oldest live line within lines. When a
+	// capacity is set, Append advances start instead of reallocating on
+	// every line; the dead prefix lines[:start] is reclaimed in bulk by a
+	// periodic compaction. The live window is always lines[start:].
+	start     int
+	name      string
+	mutex     sync.RWMutex
+	ready     chan struct{}
+	setupDone chan struct{}
+	setupOnce sync.Once
+}
+
+// drawRefreshInterval is the interval at which the screen is redrawn while
+// reading input. This provides visual feedback as new lines arrive.
+const drawRefreshInterval = 100 * time.Millisecond
+
+// NewSource creates a new Source. Does not start processing the input until you
+// call Setup()
+func NewSource(name string, in io.Reader, isInfinite bool, idgen line.IDGenerator, capacity int, enableSep bool, enableANSI bool) *Source {
+	var lines []line.Line
+	if capacity > 0 {
+		lines = make([]line.Line, 0, capacity)
+	}
+	s := &Source{
+		name:       name,
+		capacity:   capacity,
+		enableSep:  enableSep,
+		enableANSI: enableANSI,
+		idgen:      idgen,
+		in:         in, // Note that this may be closed, so do not rely on it
+		inClosed:   false,
+		isInfinite: isInfinite,
+		lines:      lines,
+		ready:      make(chan struct{}),
+		setupDone:  make(chan struct{}),
+		ChanOutput: pipeline.ChanOutput(make(chan line.Line)),
+	}
+	s.Reset()
+	return s
+}
+
+// Name returns the display name of this source.
+func (s *Source) Name() string {
+	return s.name
+}
+
+// IsInfinite reports whether the source is an infinite stream (e.g. tail -f)
+// that has not yet been closed.
+func (s *Source) IsInfinite() bool {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.isInfinite && !s.inClosed
+}
+
+// Setup reads from the input os.File.
+func (s *Source) Setup(ctx context.Context, state *Peco) {
+	s.setupOnce.Do(func() {
+		done := make(chan struct{})
+		refresh := make(chan struct{}, 1)
+		defer close(done)
+		defer close(refresh)
+		// And also, close the done channel so we can tell the consumers
+		// we have finished reading everything
+		defer close(s.setupDone)
+
+		draw := func(state *Peco) {
+			state.Hub().SendDraw(ctx, nil)
+		}
+
+		go func() {
+			ticker := time.NewTicker(drawRefreshInterval)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-done:
+					draw(state)
+					return
+				case <-ticker.C:
+					draw(state)
+				}
+			}
+		}()
+
+		// This sync.Once var is used to receive the notification
+		// that there was at least 1 line read from the source
+		// This is wrapped in a sync.Notify so we can safely call
+		// it in multiple places
+		var notify sync.Once
+		notifycb := func() {
+			// close the ready channel so others can be notified
+			// that there's at least 1 line in the buffer
+			state.Hub().SendStatusMsg(ctx, "", 0)
+			close(s.ready)
+		}
+
+		// Register this to be called in a defer, just in case we could bailed
+		// out without reading a single line.
+		// Note: this will be a no-op if notify.Do has been called before
+		defer notify.Do(notifycb)
+
+		if pdebug.Enabled {
+			pdebug.Printf("Source: using buffer size of %dkb", state.maxScanBufferSize)
+		}
+		scanbuf := make([]byte, state.maxScanBufferSize*1024)
+		scanner := bufio.NewScanner(s.in)
+		scanner.Buffer(scanbuf, state.maxScanBufferSize*1024)
+		defer func() {
+			if util.IsTty(s.in) {
+				return
+			}
+			if closer, ok := s.in.(io.Closer); ok {
+				s.mutex.Lock()
+				s.inClosed = true
+				s.mutex.Unlock()
+				closer.Close() // best-effort cleanup; error is not actionable
+			}
+		}()
+
+		// scanErr captures any I/O error from the scanner goroutine.
+		// The goroutine writes to scanErr before closing the lines channel,
+		// and the outer loop reads it after lines is closed, so no mutex
+		// is needed.
+		var scanErr error
+
+		lines := make(chan string)
+		go func() {
+			var scanned int
+			if pdebug.Enabled {
+				defer func() { pdebug.Printf("Source scanned %d lines", scanned) }()
+			}
+
+			defer close(lines)
+			for scanner.Scan() {
+				newLine := scanner.Text()
+				select {
+				case <-ctx.Done():
+					if pdebug.Enabled {
+						pdebug.Printf("Bailing out of source setup text reader loop, because ctx was canceled")
+					}
+					return
+				case lines <- newLine:
+				}
+				scanned++
+			}
+			scanErr = scanner.Err()
+		}()
+
+		state.Hub().SendStatusMsg(ctx, "Waiting for input...", 0)
+
+		readCount := 0
+		for loop := true; loop; {
+			select {
+			case <-ctx.Done():
+				if pdebug.Enabled {
+					pdebug.Printf("Bailing out of source setup, because ctx was canceled")
+				}
+				return
+			case l, ok := <-lines:
+				if !ok {
+					if pdebug.Enabled {
+						pdebug.Printf("No more lines to read...")
+					}
+					loop = false
+					break
+				}
+
+				readCount++
+				s.Append(line.NewRaw(s.idgen.Next(), l, s.enableSep, s.enableANSI))
+				notify.Do(notifycb)
+			}
+		}
+
+		if scanErr != nil {
+			state.Hub().SendStatusMsg(ctx, fmt.Sprintf("Error reading input: %s", scanErr), 0)
+		}
+
+		if pdebug.Enabled {
+			pdebug.Printf("Read all %d lines from source", readCount)
+		}
+	})
+}
+
+// Start begins sending buffered lines into the pipeline output channel.
+// If input is still being read, it resumes from where the last send left off.
+func (s *Source) Start(ctx context.Context, out pipeline.ChanOutput) {
+	var sent int
+	// I should be the only one running this method until I bail out
+	if pdebug.Enabled {
+		g := pdebug.Marker("Source.Start (%d lines in buffer)", len(s.lines))
+		defer g.End()
+		defer func() { pdebug.Printf("Source sent %d lines", sent) }()
+	}
+	defer close(out)
+
+	var resume bool
+	select {
+	case <-s.setupDone:
+	default:
+		resume = true
+	}
+
+	if !resume {
+		// no fancy resume handling needed. Send individual lines.
+		// setupDone is closed, so the buffer is stable; snapshot the live
+		// window (lines[start:]) under the lock and iterate it.
+		s.mutex.RLock()
+		live := s.lines[s.start:]
+		s.mutex.RUnlock()
+		for _, l := range live {
+			select {
+			case <-ctx.Done():
+				if pdebug.Enabled {
+					pdebug.Printf("Source: context.Done detected")
+				}
+				return
+			default:
+			}
+			if err := out.Send(ctx, l); err != nil {
+				return
+			}
+			sent++
+		}
+		return
+	}
+
+	// For the first time we get called, we may possibly be in the
+	// middle of reading a really long input stream. In this case,
+	// we should resume where we left off.
+
+	var prev = 0
+	var setupDone bool
+	for {
+		// This is where we are ready up to
+		upto := s.Size()
+		// We bail out if we are done with the setup, and our
+		// buffer has not grown
+		if setupDone && upto == prev {
+			return
+		}
+
+		// Send available lines individually
+		for i := prev; i < upto; i++ {
+			select {
+			case <-ctx.Done():
+				if pdebug.Enabled {
+					pdebug.Printf("Source: context.Done detected")
+				}
+				return
+			default:
+			}
+			l, err := s.LineAt(i)
+			if err != nil {
+				continue
+			}
+			if err := out.Send(ctx, l); err != nil {
+				return
+			}
+			sent++
+		}
+		// Remember how far we have processed
+		prev = upto
+
+		// Check if we're done with setup
+		select {
+		case <-s.setupDone:
+			setupDone = true
+		default:
+			// Avoid busy-looping while waiting for more data
+			if upto == prev {
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}
+}
+
+// Reset resets the state of the source object so that it
+// is ready to feed the filters
+func (s *Source) Reset() {
+	if pdebug.Enabled {
+		g := pdebug.Marker("Source.Reset")
+		defer g.End()
+	}
+	s.ChanOutput = pipeline.ChanOutput(make(chan line.Line))
+}
+
+// Ready returns the "input ready" channel. It will be closed as soon as
+// the first line of input is processed via Setup()
+func (s *Source) Ready() <-chan struct{} {
+	return s.ready
+}
+
+// SetupDone returns the "read all lines" channel. It will be closed as soon as
+// the all input has been read
+func (s *Source) SetupDone() <-chan struct{} {
+	return s.setupDone
+}
+
+// linesInRange returns the lines between from and to (indices into the live
+// window) from the buffer. The returned slice is a copy: Append may compact
+// the backing array in place after the lock is released, which would
+// otherwise overwrite or clear the slice the caller is still iterating.
+func (s *Source) linesInRange(from, to int) []line.Line {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	src := s.lines[s.start+from : s.start+to]
+	out := make([]line.Line, len(src))
+	copy(out, src)
+	return out
+}
+
+// LineAt returns the line at the given index (within the live window) from the buffer.
+func (s *Source) LineAt(n int) (line.Line, error) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return bufferLineAt(s.lines[s.start:], n)
+}
+
+// Size returns the number of lines currently in the buffer.
+func (s *Source) Size() int {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return len(s.lines) - s.start
+}
+
+// Append adds a new line to the source buffer. If a capacity is set and
+// exceeded, the oldest lines are discarded to maintain the limit.
+//
+// Discarding is amortized O(1): rather than reallocating and copying the
+// whole window on every line once saturated (which is O(capacity) per
+// Append), we advance the logical start index and only compact — copying
+// the live window to the front and releasing the discarded lines — once the
+// dead prefix has grown to a full window. Compaction therefore happens once
+// every capacity appends, so the per-line cost is O(1) amortized while peak
+// memory stays bounded at ~2*capacity lines.
+func (s *Source) Append(l line.Line) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	s.lines = append(s.lines, l)
+	if s.capacity <= 0 {
+		return
+	}
+
+	// Drop the oldest line logically once we are over capacity. len-start
+	// is the live size, so this keeps Size() pinned at exactly capacity.
+	if len(s.lines)-s.start > s.capacity {
+		s.start++
+	}
+
+	// Once the dead prefix is as large as the live window (len == 2*capacity),
+	// compact: slide the live window to the front, clear the freed tail so the
+	// discarded lines can be GC'd, and reset start.
+	if s.start >= s.capacity {
+		n := copy(s.lines, s.lines[s.start:])
+		clear(s.lines[n:])
+		s.lines = s.lines[:n]
+		s.start = 0
+	}
+}
